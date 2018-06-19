@@ -1,0 +1,8 @@
+.ensime*
+/.idea*
+target
+bin
+/*TAGS
+/*PATH
+.#*
+/run.sh

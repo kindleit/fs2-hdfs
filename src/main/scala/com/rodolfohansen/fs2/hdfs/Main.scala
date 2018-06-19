@@ -1,7 +1,9 @@
 package com.rodolfohansen.fs2.hdfs
 
 import cats.effect.IO
-import cats.syntax.apply._
+import cats.instances.unit._
+import cats.instances.list._
+import cats.syntax.foldable._
 
 import fs2.{Stream, StreamApp, Segment, async, text, io}
 
@@ -16,7 +18,6 @@ import java.net.URI
 import java.io.OutputStream
 
 import scala.concurrent.ExecutionContext.Implicits.global
-import scala.collection.immutable.{Stream => ScalaStream}
 
 object Main extends StreamApp[IO] {
 
@@ -43,7 +44,7 @@ object Main extends StreamApp[IO] {
 
   def write(fs: FileSystem): Stream[IO, Unit] = {
     val linesPerWrite = 1000
-    val files = 100l
+    val files = 100
     val threads = 8
 
     val source: Stream[IO, String] = {
@@ -58,18 +59,18 @@ object Main extends StreamApp[IO] {
 
     val destinations = for {
       gzip <- IO(new GzipCodec())
-      opened <- async.refOf[IO, Long](0l)
+      opened <- async.refOf[IO, Map[Int, IO[OutputStream]]](Map.empty)
       oss = {
-        def dest(i: Long) = async.once(
-          IO {
-            val fo = fs.create(new Path(s"test/output.$i.gz"))
-            gzip.createOutputStream(fo)
-          } <* opened.setSync(i + 1)
-        ).unsafeRunSync()
-        val ds = ScalaStream.range(0, files).map(dest)
-        Stream.emits(ds).evalMap(identity)
+        def create(i: Int): IO[OutputStream] = opened.modify2 { m =>
+          val fo = fs.create(new Path(s"test/output.$i.gz"))
+          val os = gzip.createOutputStream(fo)
+          (m + (i -> IO(os)), os)
+        }.map(_._2)
+        Stream.range(0, files).evalMap { i =>
+          opened.get.flatMap(_.getOrElse(i, create(i)))
+        }
       }
-      close = opened.get.flatMap(oss.take(_).observe1(os => IO(os.close)).compile.drain)
+      close = opened.get.flatMap(_.values.toList.foldMapM(_.map(_.close())))
     } yield (oss, close)
 
     def write(s: Segment[String, Unit], os: OutputStream): Stream[IO, Unit] = {

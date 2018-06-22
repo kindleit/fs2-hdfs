@@ -1,4 +1,4 @@
-package com.rodolfohansen.fs2.hdfs
+package com.rodolfohansen.fs2
 
 import cats.effect.IO
 
@@ -15,7 +15,7 @@ import java.io.File
 
 import scala.concurrent.ExecutionContext.Implicits.global
 
-object Main extends StreamApp[IO] {
+object TestApp extends StreamApp[IO] {
 
   import Stream._
   import StreamApp.{ExitCode => Exit}
@@ -45,14 +45,13 @@ object Main extends StreamApp[IO] {
 
   def logger(key: String): Logger = LoggerFactory.getLogger(key)
 
-  val service = new HDFSService[IO]
   val hdfsCluster = setupCluster()
 
   def open = {
     val uri = URI.create("/tmp/rhansen")
     val config = new Configuration()
     config.set("fs.defaultFS", "hdfs://localhost:54310")
-    service.get(uri, config)
+    hdfs.get[IO](uri, config)
   }
 
   def close(fs: FileSystem) = IO{ fs.close(); hdfsCluster.shutdown(true)}
@@ -79,7 +78,7 @@ object Main extends StreamApp[IO] {
 
     def path(i: Int) = new Path(s"/tmp/output.$i.gz")
 
-    Stream.eval(service.writePaths(path, files)(fs)).flatMap({
+    Stream.eval(hdfs.writePaths[IO](path, files)(fs)).flatMap({
       case (ds, close)  =>
         source.segmentN(linesPerWrite, true).map(toBytes)
           .prefetch.zipWith(ds.repeat)(_ to _).join(threads)

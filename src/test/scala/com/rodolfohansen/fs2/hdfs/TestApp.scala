@@ -47,14 +47,17 @@ object TestApp extends StreamApp[IO] {
 
   val hdfsCluster = setupCluster()
 
-  def open = {
+  def openFileSystem = {
     val uri = URI.create("/tmp/rhansen")
     val config = new Configuration()
     config.set("fs.defaultFS", "hdfs://localhost:54310")
     hdfs.get[IO](uri, config)
   }
 
-  def close(fs: FileSystem) = IO{ fs.close(); hdfsCluster.shutdown(true)}
+  def shutdown(fs: FileSystem) = IO {
+    fs.close()
+    hdfsCluster.shutdown()
+  }
 
   def write(fs: FileSystem): Stream[IO, Unit] = {
     val linesPerWrite = 1000
@@ -76,9 +79,10 @@ object TestApp extends StreamApp[IO] {
       Stream.chunk(Chunk.array(lines.getBytes(utf8Charset)))
     }
 
-    def path(i: Int) = new Path(s"/tmp/output.$i.gz")
+    def path(i: Int) = hdfs.create[IO](new Path(s"output.$i"), false)(fs)
 
-    Stream.eval(hdfs.writePaths[IO](path, files)(fs)).flatMap({
+
+    Stream.eval(hdfs.writePaths[IO](path, files)).flatMap({
       case (ds, close)  =>
         source.segmentN(linesPerWrite, true).map(toBytes)
           .prefetch.zipWith(ds.repeat)(_ to _).join(threads)
@@ -87,7 +91,7 @@ object TestApp extends StreamApp[IO] {
   }
 
   def stream(args: List[String], kill: IO[Unit]): Stream[IO, Exit] =
-    Stream.bracket(open)(write, close).attempt.map(exit)
+    Stream.bracket(openFileSystem)(write, shutdown).attempt.map(exit)
 
   def exit: Either[Throwable, _] => Exit = {
     case Left(e) => logger("main").error("Unexpected Failure", e); Exit(99)

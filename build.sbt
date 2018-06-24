@@ -56,8 +56,6 @@ def getInteractive(q: Seq[String]) =
 scalacOptions in (Compile, console) ~= getInteractive
 scalacOptions in (Test, console) ~= getInteractive
 
-enablePlugins(JavaAppPackaging)
-enablePlugins(DockerPlugin)
 addCompilerPlugin("org.spire-math" %% "kind-projector" % "0.9.7")
 
 lazy val root = (project in file("."))
@@ -67,7 +65,8 @@ lazy val root = (project in file("."))
                           version      := "0.1.0-SNAPSHOT")),
             name := "fs2-hdfs",
             libraryDependencies ++= fs2,
-            libraryDependencies ++= hdfsSrv,
+            libraryDependencies  += hdfsCli % "provided",
             libraryDependencies ++= logging,
-            libraryDependencies ++= Seq(hdfsCli,
-              specs2 % "test", catsTestkit % "test"))
+            libraryDependencies ++= hdfsSrv.map(_ % "test"),
+            libraryDependencies ++= Seq(specs2 % "test", catsTestkit % "test"),
+            )

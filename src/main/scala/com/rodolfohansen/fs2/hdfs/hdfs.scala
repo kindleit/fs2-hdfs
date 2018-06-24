@@ -8,7 +8,9 @@ import cats.syntax.foldable._
 import cats.syntax.functor._
 import cats.syntax.flatMap._
 
-import fs2.{Chunk, Sink, Stream, async, io}
+import fs2.{Sink, Stream, async, io}
+import fs2.async.Ref
+import fs2.async.mutable.Queue
 
 import scala.concurrent.ExecutionContext
 
@@ -59,7 +61,8 @@ package object hdfs {
   }
 
   /** Return a Stream of Sinks thats will write to the supplied HDFS Path(s) and a bindable action to close them. */
-  def writePaths[F[_]](writer: Int => F[OutputStream], maxFiles: Int)(implicit F: Sync[F]): F[(Stream[F, Sink[F, Byte]], F[Unit])] =
+  def writePaths[F[_]](writer: Int => F[OutputStream], maxFiles: Int)
+                (implicit F: Sync[F]): F[(Stream[F, Sink[F, Byte]], F[Unit])] =
     async.refOf[F, Map[Int, (F[Sink[F, Byte]], F[Unit])]](Map.empty) map { opened =>
 
       def create(i: Int): F[Sink[F, Byte]] = opened.modify2 { m =>
@@ -78,30 +81,36 @@ package object hdfs {
       (dests, closeAll)
     }
 
-  /** Return a Stream of Sinks thats will write to the supplied HDFS Path(s) and a bindable action to close them. */
-  def writePathsAsync[F[_], IDX](writer: IDX => F[OutputStream], concurrentWrites: Int = 8, fileQueue: Int = 1)(implicit F: Effect[F], ec: ExecutionContext): Sink[F, (IDX, Array[Byte])] = {
-    type SinkMap = Map[IDX, (F[Sink[F, Array[Byte]]], F[Unit], F[async.mutable.Queue[F, Array[Byte]]])]
+  /** Return a single Sink thats will distribute writes via an indexed stream
+    * of byte arrays. The generated sink holds per Outputstream queues to
+    * garuantee ordered writes per index. The individual Outputstreams are held
+    * open for the duration the sink is open and they will be closed together
+    * once all data has been written out.
+    */
+  def writePathsAsync[F[_], IDX](writer: IDX => F[OutputStream], concurrentWrites: Int = 8, fileQueue: Int = 1)
+                     (implicit F: Effect[F], ec: ExecutionContext): Sink[F, (IDX, Array[Byte])] = {
+    type SinkMap = Map[IDX, (Sink[F, Array[Byte]], F[Unit], F[Queue[F, Array[Byte]]])]
 
-    def viaChunks(s: Stream[F, Array[Byte]]): Stream[F, Byte] =
-      s.flatMap(bs => Stream.chunk(Chunk.bytes(bs)))
+    def writeAsync(os: OutputStream, buf: Array[Byte]): F[Unit] =
+      async.start(F.delay(os.write(buf))).flatMap(identity)
 
-    def getOrCreate(sinks: async.Ref[F, SinkMap], i: IDX): F[(Sink[F, Array[Byte]], async.mutable.Queue[F, Array[Byte]])] =
-      sinks.get.flatMap(_.get(i).fold(create(sinks, i))(m => (m._1, m._3).tupled))
-
-    def create(sinks: async.Ref[F, SinkMap], i: IDX): F[(Sink[F, Array[Byte]], async.mutable.Queue[F, Array[Byte]])] =
+    def create(sinks: Ref[F, SinkMap], i: IDX): F[(Sink[F, Array[Byte]], Queue[F, Array[Byte]])] =
       sinks.modify2 { m =>
         val os    = writer(i)
         val close = os.map(_.close)
-        val sink  = F.delay(io.writeOutputStreamAsync(os, false).compose(viaChunks))
+        val sink: Sink[F, Array[Byte]] = _.evalMap(bs => os.flatMap(os => writeAsync(os, bs)))
         val queue = async.boundedQueue[F, Array[Byte]](fileQueue)
-        (m + (i -> ((sink, close, queue))), (sink, queue).tupled)
+        (m + (i -> ((sink, close, queue))), queue.map((sink, _)))
       }.flatMap(_._2)
 
-    def closeAll(sinks: async.Ref[F, SinkMap]): F[Unit] =
+    def getOrCreate(sinks: Ref[F, SinkMap], i: IDX): F[(Sink[F, Array[Byte]], Queue[F, Array[Byte]])] =
+      sinks.get.flatMap(_.get(i).fold(create(sinks, i))(m => m._3.map((m._1, _))))
+
+    def closeAll(sinks: Ref[F, SinkMap]): F[Unit] =
       sinks.get.flatMap(_.values.toList.foldMapM(_._2))
 
     source => {
-      def useSinks(sinks: async.Ref[F, SinkMap]): Stream[F, Stream[F, Unit]] = {
+      def useSinks(sinks: Ref[F, SinkMap]): Stream[F, Stream[F, Unit]] = {
         source.flatMap { case (i, bytes) =>
           Stream.eval(getOrCreate(sinks, i)).map { case (sink, queue) =>
               Stream.eval(queue.enqueue1(bytes)) ++ queue.dequeue.to(sink)

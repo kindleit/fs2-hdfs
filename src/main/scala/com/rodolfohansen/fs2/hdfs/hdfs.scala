@@ -90,20 +90,21 @@ package object hdfs {
   def writePathsAsync[F[_], IDX](writer: IDX => F[OutputStream], concurrentWrites: Int = 8, fileQueue: Int = 1)
                      (implicit F: Effect[F], ec: ExecutionContext): Sink[F, (IDX, Array[Byte])] = {
     type SinkMap = Map[IDX, (Sink[F, Array[Byte]], F[Unit], F[Queue[F, Array[Byte]]])]
+    type SinkAndQueue = (Sink[F, Array[Byte]], Queue[F, Array[Byte]])
 
     def writeAsync(os: OutputStream, buf: Array[Byte]): F[Unit] =
       async.start(F.delay(os.write(buf))).flatMap(identity)
 
-    def create(sinks: Ref[F, SinkMap], i: IDX): F[(Sink[F, Array[Byte]], Queue[F, Array[Byte]])] =
+    def create(sinks: Ref[F, SinkMap], i: IDX): F[SinkAndQueue] =
       sinks.modify2 { m =>
         val os    = writer(i)
         val close = os.map(_.close)
-        val sink: Sink[F, Array[Byte]] = _.evalMap(bs => os.flatMap(os => writeAsync(os, bs)))
+        val sink  = (_:Stream[F, Array[Byte]]).evalMap(bs => os.flatMap(writeAsync(_, bs)))
         val queue = async.boundedQueue[F, Array[Byte]](fileQueue)
         (m + (i -> ((sink, close, queue))), queue.map((sink, _)))
       }.flatMap(_._2)
 
-    def getOrCreate(sinks: Ref[F, SinkMap], i: IDX): F[(Sink[F, Array[Byte]], Queue[F, Array[Byte]])] =
+    def getOrCreate(sinks: Ref[F, SinkMap], i: IDX): F[SinkAndQueue] =
       sinks.get.flatMap(_.get(i).fold(create(sinks, i))(m => m._3.map((m._1, _))))
 
     def closeAll(sinks: Ref[F, SinkMap]): F[Unit] =

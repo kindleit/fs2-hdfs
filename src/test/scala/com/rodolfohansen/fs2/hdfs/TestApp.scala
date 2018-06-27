@@ -74,20 +74,34 @@ object TestApp extends StreamApp[IO] {
         .through(text.lines)
     }
 
-    def toBytes(s: Segment[String, Unit]): Stream[IO, Byte] = {
+    def toBytes(s: Segment[String, _]): Array[Byte] = {
       val lines = s.force.toList.mkString("", "\n", "\n")
-      Stream.chunk(Chunk.array(lines.getBytes(utf8Charset)))
+      lines.getBytes(utf8Charset)
     }
 
+    def toByteStream(s: Segment[String, Unit]): Stream[IO, Byte] =
+      Stream.chunk(Chunk.array(toBytes(s)))
+
     def path(i: Int) = hdfs.create[IO](new Path(s"output.$i"), false)(fs)
+    def path2(i: Int) = hdfs.create[IO](new Path(s"second.$i"), false)(fs)
 
 
+    //Uses writePaths which fails to complete inversion of controll, but
+    //looses its restriction on requiring its input to be an indexed byte array.
+    //Clients end up having to control how they operate with the returned
+    //stream of sinks + close effect
     Stream.eval(hdfs.writePaths[IO](path, files)).flatMap({
       case (ds, close)  =>
-        source.segmentN(linesPerWrite, true).map(toBytes)
+        source.segmentN(linesPerWrite, true).map(toByteStream)
           .prefetch.zipWith(ds.repeat)(_ to _).join(threads)
           .onFinalize(close)
     })
+
+    //Simpler, well encapsulated synk. you just need the stream value to be
+    // (IDX -> Byte[Array])
+    source.segmentN(linesPerWrite, true).zipWithIndex
+      .map { case (s, i) => ((i % files).toInt, toBytes(s)) }
+      .to (hdfs.writePathsAsync(path2, threads))
   }
 
   def stream(args: List[String], kill: IO[Unit]): Stream[IO, Exit] =

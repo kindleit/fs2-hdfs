@@ -1,10 +1,13 @@
-package com.rodolfohansen.fs2
+package kindleit.fs2.hdfs
 
 import cats.effect.IO
 
 import fs2.{Chunk, Stream, StreamApp, Segment, text, io}
 
 import org.slf4j.{Logger, LoggerFactory}
+
+import org.specs2._
+import org.specs2.concurrent.ExecutionEnv
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
@@ -13,12 +16,17 @@ import org.apache.hadoop.hdfs.{HdfsConfiguration, MiniDFSCluster}
 import java.net.URI
 import java.io.File
 
-import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration._
 
-object TestApp extends StreamApp[IO] {
+class HDFSWriterSpec(implicit ee: ExecutionEnv) extends Specification {
 
   import Stream._
   import StreamApp.{ExitCode => Exit}
+
+  def is = s2"""
+  Run over a miniHDFS setup
+    ${run must haveSize[List[Exit]](1).awaitFor(1.minute)}
+    ${run.map(_.head) must be_==(Exit(0)).awaitFor(1.minute)} """
 
   def getTestDir: File = {
     val targetDir = new File("target")
@@ -41,17 +49,17 @@ object TestApp extends StreamApp[IO] {
 
   val utf8Charset = java.nio.charset.Charset.forName("UTF8")
 
-  val start = System.currentTimeMillis
+  lazy val start = System.currentTimeMillis
 
   def logger(key: String): Logger = LoggerFactory.getLogger(key)
 
-  val hdfsCluster = setupCluster()
+  lazy val hdfsCluster = setupCluster()
 
   def openFileSystem = {
     val uri = URI.create("/tmp/rhansen")
     val config = new Configuration()
     config.set("fs.defaultFS", "hdfs://localhost:54310")
-    hdfs.get[IO](uri, config)
+    get[IO](uri, config)
   }
 
   def shutdown(fs: FileSystem) = IO {
@@ -82,15 +90,15 @@ object TestApp extends StreamApp[IO] {
     def toByteStream(s: Segment[String, Unit]): Stream[IO, Byte] =
       Stream.chunk(Chunk.array(toBytes(s)))
 
-    def path(i: Int) = hdfs.create[IO](new Path(s"output.$i"), false)(fs)
-    def path2(i: Int) = hdfs.create[IO](new Path(s"second.$i"), false)(fs)
+    def path(i: Int) = create[IO](new Path(s"output.$i"), false)(fs)
+    def path2(i: Int) = create[IO](new Path(s"second.$i"), false)(fs)
 
 
     //Uses writePaths which fails to complete inversion of controll, but
     //looses its restriction on requiring its input to be an indexed byte array.
     //Clients end up having to control how they operate with the returned
     //stream of sinks + close effect
-    Stream.eval(hdfs.writePaths[IO](path, files)).flatMap({
+    Stream.eval(writePaths[IO](path, files)).flatMap({
       case (ds, close)  =>
         source.segmentN(linesPerWrite, true).map(toByteStream)
           .prefetch.zipWith(ds.repeat)(_ to _).join(threads)
@@ -101,11 +109,14 @@ object TestApp extends StreamApp[IO] {
     // (IDX -> Byte[Array])
     source.segmentN(linesPerWrite, true).zipWithIndex
       .map { case (s, i) => ((i % files).toInt, toBytes(s)) }
-      .to (hdfs.writePathsAsync(path2, threads))
+      .to (writePathsAsync(path2, threads))
+      .drain
   }
 
-  def stream(args: List[String], kill: IO[Unit]): Stream[IO, Exit] =
-    Stream.bracket(openFileSystem)(write, shutdown).attempt.map(exit)
+  lazy val run = Stream.bracket(openFileSystem)(write, shutdown)
+    .attempt.map(exit)
+    .compile.toList.unsafeToFuture()
+
 
   def exit: Either[Throwable, _] => Exit = {
     case Left(e) => logger("main").error("Unexpected Failure", e); Exit(99)

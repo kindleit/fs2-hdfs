@@ -68,5 +68,5 @@ lazy val root = (project in file("."))
             libraryDependencies  += hdfsCli % "provided",
             libraryDependencies ++= logging,
             libraryDependencies ++= hdfsSrv.map(_ % "test"),
-            libraryDependencies ++= Seq(specs2 % "test", catsTestkit % "test"),
+            libraryDependencies += specs2 % "test",
             )

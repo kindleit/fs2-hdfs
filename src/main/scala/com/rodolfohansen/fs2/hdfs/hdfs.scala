@@ -1,4 +1,4 @@
-package com.rodolfohansen.fs2
+package kindleit.fs2
 
 import cats.effect.{Effect, Sync}
 import cats.instances.unit._

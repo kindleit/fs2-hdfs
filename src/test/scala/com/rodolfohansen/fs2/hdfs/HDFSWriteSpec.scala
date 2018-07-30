@@ -1,12 +1,14 @@
 package kindleit.fs2.hdfs
 
 import cats.effect.IO
+import cats.instances.unit._
 
 import fs2.{Chunk, Stream, StreamApp, Segment, text, io}
 
 import org.slf4j.{Logger, LoggerFactory}
 
 import org.specs2._
+import org.specs2.specification.BeforeAfterAll
 import org.specs2.concurrent.ExecutionEnv
 
 import org.apache.hadoop.conf.Configuration
@@ -16,17 +18,28 @@ import org.apache.hadoop.hdfs.{HdfsConfiguration, MiniDFSCluster}
 import java.net.URI
 import java.io.File
 
+import scala.concurrent.Future
 import scala.concurrent.duration._
 
-class HDFSWriterSpec(implicit ee: ExecutionEnv) extends Specification {
+class HDFSWriterSpec(implicit ee: ExecutionEnv) extends Specification with BeforeAfterAll {
 
   import Stream._
   import StreamApp.{ExitCode => Exit}
 
   def is = s2"""
-  Run over a miniHDFS setup
-    ${run must haveSize[List[Exit]](1).awaitFor(1.minute)}
-    ${run.map(_.head) must be_==(Exit(0)).awaitFor(1.minute)} """
+  hdfs.writePaths should
+    Have a single exit code. ${matchRunLength(wpRun)}
+    Exit with code 0.        ${matchRunExitCode(wpRun)}
+  hdfs.writePathsAsync should
+    Have a single exit code. ${matchRunLength(wpaRun)}
+    Exit with code 0.        ${matchRunExitCode(wpaRun)}
+  """
+
+  def matchRunLength(run: Future[List[Exit]]) =
+    run must haveSize[List[Exit]](1).awaitFor(1.minute)
+
+  def matchRunExitCode(run: Future[List[Exit]]) =
+    run.map(_.head) must be_==(Exit(0)).awaitFor(1.minute)
 
   def getTestDir: File = {
     val targetDir = new File("target")
@@ -49,50 +62,60 @@ class HDFSWriterSpec(implicit ee: ExecutionEnv) extends Specification {
 
   val utf8Charset = java.nio.charset.Charset.forName("UTF8")
 
-  lazy val start = System.currentTimeMillis
-
   def logger(key: String): Logger = LoggerFactory.getLogger(key)
 
-  lazy val hdfsCluster = setupCluster()
+  lazy val start = System.currentTimeMillis
+  val hdfsCluster = setupCluster()
+
+  override def beforeAll = {
+    logger("main").info(s"before All $start")
+    hdfsCluster.waitClusterUp()
+  }
+
+  override def afterAll = {
+    logger("main").info("after All")
+    hdfsCluster.shutdown()
+  }
+
 
   def openFileSystem = {
+    logger("main").info("Opening FS")
     val uri = URI.create("/tmp/rhansen")
     val config = new Configuration()
     config.set("fs.defaultFS", "hdfs://localhost:54310")
     get[IO](uri, config)
   }
 
-  def shutdown(fs: FileSystem) = IO {
+  def closeFileSystem(fs: FileSystem) = IO {
+    logger("main").info("Closing FS")
     fs.close()
-    hdfsCluster.shutdown()
   }
 
+  val linesPerWrite = 1000
+  val files = 100
+  val threads = 8
+
+  val source: Stream[IO, String] = {
+    val in = IO(new java.util.zip.GZIPInputStream(
+                  new java.io.FileInputStream(
+                    new java.io.File("/home/rhansen/file.gz"))))
+
+    io.readInputStream[IO](in, 10000, true)
+      .through(text.utf8Decode)
+      .through(text.lines)
+  }
+
+  def toBytes(s: Segment[String, _]): Array[Byte] = {
+    val lines = s.force.toList.mkString("", "\n", "\n")
+    lines.getBytes(utf8Charset)
+  }
+
+  def toByteStream(s: Segment[String, Unit]): Stream[IO, Byte] =
+    Stream.chunk(Chunk.array(toBytes(s)))
+
+
   def write(fs: FileSystem): Stream[IO, Unit] = {
-    val linesPerWrite = 1000
-    val files = 100
-    val threads = 8
-
-    val source: Stream[IO, String] = {
-      val in = IO(new java.util.zip.GZIPInputStream(
-                    new java.io.FileInputStream(
-                      new java.io.File("/home/rhansen/file.gz"))))
-
-      io.readInputStream[IO](in, 10000, true)
-        .through(text.utf8Decode)
-        .through(text.lines)
-    }
-
-    def toBytes(s: Segment[String, _]): Array[Byte] = {
-      val lines = s.force.toList.mkString("", "\n", "\n")
-      lines.getBytes(utf8Charset)
-    }
-
-    def toByteStream(s: Segment[String, Unit]): Stream[IO, Byte] =
-      Stream.chunk(Chunk.array(toBytes(s)))
-
     def path(i: Int) = create[IO](new Path(s"output.$i"), false)(fs)
-    def path2(i: Int) = create[IO](new Path(s"second.$i"), false)(fs)
-
 
     //Uses writePaths which fails to complete inversion of controll, but
     //looses its restriction on requiring its input to be an indexed byte array.
@@ -103,7 +126,11 @@ class HDFSWriterSpec(implicit ee: ExecutionEnv) extends Specification {
         source.segmentN(linesPerWrite, true).map(toByteStream)
           .prefetch.zipWith(ds.repeat)(_ to _).join(threads)
           .onFinalize(close)
-    })
+    }).foldMonoid
+  }
+
+  def writeAsync(fs: FileSystem): Stream[IO, Unit] = {
+    def path2(i: Int) = create[IO](new Path(s"second.$i"), false)(fs)
 
     //Simpler, well encapsulated synk. you just need the stream value to be
     // (IDX -> Byte[Array])
@@ -113,10 +140,14 @@ class HDFSWriterSpec(implicit ee: ExecutionEnv) extends Specification {
       .drain
   }
 
-  lazy val run = Stream.bracket(openFileSystem)(write, shutdown)
+
+  lazy val wpRun = Stream.bracket(openFileSystem)(write, closeFileSystem)
     .attempt.map(exit)
     .compile.toList.unsafeToFuture()
 
+  lazy val wpaRun = Stream.bracket(openFileSystem)(writeAsync, closeFileSystem)
+    .attempt.map(exit)
+    .compile.toList.unsafeToFuture()
 
   def exit: Either[Throwable, _] => Exit = {
     case Left(e) => logger("main").error("Unexpected Failure", e); Exit(99)

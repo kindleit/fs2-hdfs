@@ -123,11 +123,11 @@ lazy val root = (project in file("."))
   .settings(scaladocSettings)
   .settings(publishingSettings)
   .settings(releaseSettings)
-  .settings(organization := "kindleit",
+  .settings(organization := "net.kindleit",
             name := "fs2-hdfs",
             scalaVersion := "2.12.6",
             crossScalaVersions := Seq("2.11.12", "2.12.6"),
-            scmInfo := Some(ScmInfo(url("https://github.com/kryptt/fs2-hdfs"), "git@github.com:kryptt/fs2-hdfs.git")),
+            scmInfo := Some(ScmInfo(url("https://github.com/kindleit/fs2-hdfs"), "git@github.com:kindleit/fs2-hdfs.git")),
             homepage := None,
             licenses += ("MIT", url("http://opensource.org/licenses/MIT")),
             libraryDependencies ++= fs2,

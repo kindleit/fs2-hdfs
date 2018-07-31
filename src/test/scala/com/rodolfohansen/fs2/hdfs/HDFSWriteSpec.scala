@@ -28,15 +28,10 @@ class HDFSWriterSpec(implicit ee: ExecutionEnv) extends Specification with Befor
 
   def is = s2"""
   hdfs.writePaths should
-    Have a single exit code. ${matchRunLength(wpRun)}
-    Exit with code 0.        ${matchRunExitCode(wpRun)}
+    Exited cleanly.        ${matchRunExitCode(wpRun)}
   hdfs.writePathsAsync should
-    Have a single exit code. ${matchRunLength(wpaRun)}
-    Exit with code 0.        ${matchRunExitCode(wpaRun)}
+    Exited cleanly.        ${matchRunExitCode(wpaRun)}
   """
-
-  def matchRunLength(run: Future[List[Exit]]) =
-    run must haveSize[List[Exit]](1).awaitFor(1.minute)
 
   def matchRunExitCode(run: Future[List[Exit]]) =
     run.map(_.head) must be_==(Exit(0)).awaitFor(1.minute)
@@ -95,7 +90,7 @@ class HDFSWriterSpec(implicit ee: ExecutionEnv) extends Specification with Befor
   val files = 100
   val threads = 8
 
-  val source: Stream[IO, String] = {
+  def source: Stream[IO, String] = {
     val in = IO(new java.util.zip.GZIPInputStream(
                   new java.io.FileInputStream(
                     new java.io.File("/home/rhansen/file.gz"))))
@@ -110,12 +105,11 @@ class HDFSWriterSpec(implicit ee: ExecutionEnv) extends Specification with Befor
     lines.getBytes(utf8Charset)
   }
 
-  def toByteStream(s: Segment[String, Unit]): Stream[IO, Byte] =
-    Stream.chunk(Chunk.array(toBytes(s)))
-
-
   def write(fs: FileSystem): Stream[IO, Unit] = {
     def path(i: Int) = create[IO](new Path(s"output.$i"), false)(fs)
+
+    def toByteStream(s: Segment[String, Unit]): Stream[IO, Byte] =
+      Stream.chunk(Chunk.array(toBytes(s)))
 
     //Uses writePaths which fails to complete inversion of controll, but
     //looses its restriction on requiring its input to be an indexed byte array.
@@ -130,16 +124,15 @@ class HDFSWriterSpec(implicit ee: ExecutionEnv) extends Specification with Befor
   }
 
   def writeAsync(fs: FileSystem): Stream[IO, Unit] = {
-    def path2(i: Int) = create[IO](new Path(s"second.$i"), false)(fs)
+    def path(i: Int) = create[IO](new Path(s"second.$i"), false)(fs)
 
     //Simpler, well encapsulated synk. you just need the stream value to be
     // (IDX -> Byte[Array])
     source.segmentN(linesPerWrite, true).zipWithIndex
       .map { case (s, i) => ((i % files).toInt, toBytes(s)) }
-      .to (writePathsAsync(path2, threads))
-      .drain
+      .to (writePathsAsync(path, threads))
+      .foldMonoid
   }
-
 
   lazy val wpRun = Stream.bracket(openFileSystem)(write, closeFileSystem)
     .attempt.map(exit)

@@ -1,17 +1,14 @@
 package kindleit.fs2
 
 import cats.effect.{Effect, Sync}
-import cats.instances.unit._
-import cats.instances.list._
 import cats.syntax.apply._
-import cats.syntax.foldable._
 import cats.syntax.functor._
 import cats.syntax.flatMap._
 
 import fs2.{Sink, Stream, async, io}
 import fs2.async.Ref
-import fs2.async.mutable.Queue
 
+import scala.util.Try
 import scala.concurrent.ExecutionContext
 
 import org.apache.hadoop.conf.Configuration
@@ -63,22 +60,17 @@ package object hdfs {
   /** Return a Stream of Sinks thats will write to the supplied HDFS Path(s) and a bindable action to close them. */
   def writePaths[F[_]](writer: Int => F[OutputStream], maxFiles: Int)
                 (implicit F: Sync[F]): F[(Stream[F, Sink[F, Byte]], F[Unit])] =
-    async.refOf[F, Map[Int, (F[Sink[F, Byte]], F[Unit])]](Map.empty) map { opened =>
+    async.refOf[F, F[Unit]](F.pure(())) map { closeAll =>
 
-      def create(i: Int): F[Sink[F, Byte]] = opened.modify2 { m =>
-        val os    = writer(i)
-        val sink  = io.writeOutputStream(os, false)
-        val close = os.map(_.close)
-        (m + (i -> ((F.delay(sink), close))), sink)
-      }.map(_._2)
+      def create(i: Int): F[Sink[F, Byte]] = for {
+        os <- writer(i)
+        sink  = io.writeOutputStream(F.pure(os), false)
+        _  <- closeAll.modify(_ *> F.delay(os.close))
+      } yield sink
 
-      val closeAll = opened.get.flatMap(_.values.toList.foldMapM(_._2))
+      val dests: Stream[F, Sink[F, Byte]] = Stream.range(0, maxFiles).evalMap(create)
 
-      val dests: Stream[F, Sink[F, Byte]] = Stream.range(0, maxFiles).evalMap { i =>
-        opened.get.flatMap(_.get(i).fold(create(i))(_._1))
-      }
-
-      (dests, closeAll)
+      (dests, closeAll.get.flatten)
     }
 
   /** Return a single Sink thats will distribute writes via an indexed stream
@@ -87,38 +79,33 @@ package object hdfs {
     * open for the duration the sink is open and they will be closed together
     * once all data has been written out.
     */
-  def writePathsAsync[F[_], IDX](writer: IDX => F[OutputStream], concurrentWrites: Int = 8, fileQueue: Int = 1)
+  def writePathsAsync[F[_], IDX](writer: IDX => F[OutputStream], concurrentWrites: Int = 8)
                      (implicit F: Effect[F], ec: ExecutionContext): Sink[F, (IDX, Array[Byte])] = {
-    type SinkMap = Map[IDX, (Sink[F, Array[Byte]], F[Unit], F[Queue[F, Array[Byte]]])]
-    type SinkAndQueue = (Sink[F, Array[Byte]], Queue[F, Array[Byte]])
+    type Memory = (Map[IDX, F[OutputStream]], F[Unit])
+
+    def memStep(i: IDX, os: OutputStream, m: Memory): Memory =
+      (m._1 + (i -> F.pure(os)), m._2 *> F.delay(os.close))
 
     def writeAsync(os: OutputStream, buf: Array[Byte]): F[Unit] =
-      async.start(F.delay(os.write(buf))).flatMap(identity)
+      F.async (_(Try(os.write(buf)).toEither))
 
-    def create(sinks: Ref[F, SinkMap], i: IDX): F[SinkAndQueue] =
-      sinks.modify2 { m =>
-        val os    = writer(i)
-        val close = os.map(_.close)
-        val sink  = (_:Stream[F, Array[Byte]]).evalMap(bs => os.flatMap(writeAsync(_, bs)))
-        val queue = async.boundedQueue[F, Array[Byte]](fileQueue)
-        (m + (i -> ((sink, close, queue))), queue.map((sink, _)))
-      }.flatMap(_._2)
-
-    def getOrCreate(sinks: Ref[F, SinkMap], i: IDX): F[SinkAndQueue] =
-      sinks.get.flatMap(_.get(i).fold(create(sinks, i))(m => m._3.map((m._1, _))))
-
-    def closeAll(sinks: Ref[F, SinkMap]): F[Unit] =
-      sinks.get.flatMap(_.values.toList.foldMapM(_._2))
+    def closeAll(m: Ref[F, Memory]): F[Unit] =
+      m.get.flatMap(_._2)
 
     source => {
-      def useSinks(sinks: Ref[F, SinkMap]): Stream[F, Stream[F, Unit]] = {
-        source.flatMap { case (i, bytes) =>
-          Stream.eval(getOrCreate(sinks, i)).map { case (sink, queue) =>
-              Stream.eval(queue.enqueue1(bytes)) ++ queue.dequeue.to(sink)
-          }
-        }
+      def writes(m: Ref[F, Memory]): Stream[F, Stream[F, Unit]] = source.map {
+        case (i, bytes) =>
+          val create: F[OutputStream] =
+            writer(i).flatTap(os => m.modify(memStep(i, os, _)))
+
+          val getOrCreate: F[OutputStream] =
+            m.get.flatMap(_._1.get(i).getOrElse(create))
+
+          Stream.eval(getOrCreate.flatMap(writeAsync(_, bytes)))
       }
-      Stream.bracket(async.refOf[F, SinkMap](Map.empty))(useSinks(_).join(concurrentWrites), closeAll)
+
+      val empty: Memory = (Map.empty, F.pure(()))
+      Stream.bracket(async.refOf(empty))(writes(_).join(concurrentWrites), closeAll)
     }
   }
 

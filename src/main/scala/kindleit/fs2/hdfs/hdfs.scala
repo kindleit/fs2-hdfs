@@ -18,6 +18,8 @@ import org.apache.hadoop.io.compress.GzipCodec
 import java.net.URI
 import java.io.{InputStream, OutputStream}
 
+/** Provides various ways to work with streams that perform HDFS operations.
+  * These combinators can be re-used with fs2.io methods for nice and clean HDFS reads and writes. */
 package object hdfs {
 
   /** Safe construction of an HDFS FileSystem from a Configuration. */

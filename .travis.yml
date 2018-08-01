@@ -1,0 +1,20 @@
+language : scala
+sudo: required
+
+services:
+  - docker
+
+scala:
+  - 2.11.12
+  - 2.12.6
+
+cache:
+  directories:
+  - $HOME/.ivy2
+  - $HOME/.sbt
+
+jdk:
+  - oraclejdk8
+
+script:
+- sbt ++$TRAVIS_SCALA_VERSION -Dfile.encoding=UTF8 test

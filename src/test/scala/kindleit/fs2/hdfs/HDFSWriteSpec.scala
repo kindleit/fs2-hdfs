@@ -92,8 +92,7 @@ class HDFSWriterSpec(implicit ee: ExecutionEnv) extends Specification with Befor
 
   def source: Stream[IO, String] = {
     val in = IO(new java.util.zip.GZIPInputStream(
-                  new java.io.FileInputStream(
-                    new java.io.File("/home/rhansen/file.gz"))))
+                  getClass.getResourceAsStream("/file.gz")))
 
     io.readInputStream[IO](in, 10000, true)
       .through(text.utf8Decode)

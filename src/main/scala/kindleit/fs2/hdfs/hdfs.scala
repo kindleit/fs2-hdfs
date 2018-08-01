@@ -5,10 +5,9 @@ import cats.syntax.apply._
 import cats.syntax.functor._
 import cats.syntax.flatMap._
 
-import fs2.{Sink, Stream, async, io}
+import fs2.{Chunk, Sink, Stream, async, io}
 import fs2.async.Ref
 
-import scala.util.Try
 import scala.concurrent.ExecutionContext
 
 import org.apache.hadoop.conf.Configuration
@@ -80,16 +79,22 @@ package object hdfs {
     * garuantee ordered writes per index. The individual Outputstreams are held
     * open for the duration the sink is open and they will be closed together
     * once all data has been written out.
+    * You are guaranteed:
+    * - writes to each Outputstream are sequential
+    * - the chunkiness is preserved; that is to say the incomming  byte arrays are sent verbatim.
     */
   def writePathsAsync[F[_], IDX](writer: IDX => F[OutputStream], concurrentWrites: Int = 8)
                      (implicit F: Effect[F], ec: ExecutionContext): Sink[F, (IDX, Array[Byte])] = {
-    type Memory = (Map[IDX, F[OutputStream]], F[Unit])
+    type Snk = Sink[F, Byte]
+    type Memory = (Map[IDX, Snk], F[Unit])
 
-    def memStep(i: IDX, os: OutputStream, m: Memory): Memory =
-      (m._1 + (i -> F.pure(os)), m._2 *> F.delay(os.close))
+    def memStep(i: IDX, os: OutputStream, m: Ref[F, Memory]): F[Snk] = {
+      val data = io.writeOutputStreamAsync(F.pure(os), false)
+      m.modify(mem => (mem._1 + (i -> data), mem._2 *> F.delay(os.close))).map(_ => data)
+    }
 
-    def writeAsync(os: OutputStream, buf: Array[Byte]): F[Unit] =
-      F.async (_(Try(os.write(buf)).toEither))
+    def writeAsync(sink: Sink[F, Byte], buf: Array[Byte]): Stream[F, Unit] =
+      Stream.chunk(Chunk.array(buf)).covary[F].to(sink)
 
     def closeAll(m: Ref[F, Memory]): F[Unit] =
       m.get.flatMap(_._2)
@@ -97,13 +102,13 @@ package object hdfs {
     source => {
       def writes(m: Ref[F, Memory]): Stream[F, Stream[F, Unit]] = source.map {
         case (i, bytes) =>
-          val create: F[OutputStream] =
-            writer(i).flatTap(os => m.modify(memStep(i, os, _)))
+          val create: F[Snk] =
+            writer(i).flatMap(memStep(i, _, m))
 
-          val getOrCreate: F[OutputStream] =
-            m.get.flatMap(_._1.get(i).getOrElse(create))
+          val getOrCreate: F[Snk] =
+            m.get.flatMap(_._1.get(i).map(F.pure).getOrElse(create))
 
-          Stream.eval(getOrCreate.flatMap(writeAsync(_, bytes)))
+          Stream.eval(getOrCreate).flatMap(writeAsync(_, bytes))
       }
 
       val empty: Memory = (Map.empty, F.pure(()))
